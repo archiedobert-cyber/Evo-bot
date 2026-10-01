@@ -79,6 +79,10 @@ UPGRADES_PER_LINE = 5
 # then on its card on the listing page.
 IMAGE_MODE = "thumbnail"
 
+# Optional picture to use when the bot can't find one for an evo, e.g. a link to an
+# image you've uploaded to the repo or Discord. "" = no picture in that case.
+IMAGE_FALLBACK = ""
+
 SKIP = ["script", "style", "nav", "header", "footer"]
 
 
@@ -224,6 +228,46 @@ POSITION_PREFIX = re.compile(r"^(?:GK|CB|RB|LB|RWB|LWB|CDM|CM|CAM|RM|LM|RW|LW|CF
 NOT_PLAYSTYLE = re.compile(r"^(?:\d+|[A-Z]|option\s+\w|recommended|pick one|[A-Z]{2,3})$", re.I)
 
 
+AMOUNT_RE = re.compile(r"^\+\s*(\d+)$")
+NAME_RE = re.compile(r"^[A-Za-z][A-Za-z .'/-]*$")
+# (where the name sits, where the max sits) relative to the "+5" piece
+LAYOUTS = [(1, 2), (-1, 1), (2, 1), (1, -1), (-2, -1), (-1, -2)]
+
+
+def parse_any_order(tokens):
+    """Fallback for when name, amount and max are separate pieces in an unknown
+    order: work out which layout fits the most "+N" pieces, then use it."""
+    amounts = [i for i, t in enumerate(tokens) if AMOUNT_RE.match(t)]
+
+    def pick(i, layout):
+        ni, mi = i + layout[0], i + layout[1]
+        if 0 <= ni < len(tokens) and 0 <= mi < len(tokens):
+            if NAME_RE.match(tokens[ni]) and re.fullmatch(r"\d+", tokens[mi]):
+                return ni, mi
+        return None
+
+    best, best_n = None, 0
+    for layout in LAYOUTS:
+        n = sum(1 for i in amounts if pick(i, layout))
+        if n > best_n:
+            best, best_n = layout, n
+    if not best:
+        return [], []
+    ups, used = [], set()
+    for i in amounts:
+        r = pick(i, best)
+        if r:
+            used |= {i, r[0], r[1]}
+            name = tokens[r[0]].strip()
+            ups.append({"amount": AMOUNT_RE.match(tokens[i]).group(1), "name": ATTR_NAMES.get(name, name), "max": tokens[r[1]]})
+    styles = [
+        POSITION_PREFIX.sub("", t)
+        for k, t in enumerate(tokens)
+        if k not in used and not NOT_PLAYSTYLE.match(t) and not t.startswith("+")
+    ]
+    return ups, styles
+
+
 def parse_upgrades(tokens):
     """-> (upgrades [{'amount','name','max'}], playstyles [str]).
     Copes with the page giving an upgrade as one piece ("+5 OVR80"), as two
@@ -259,6 +303,8 @@ def parse_upgrades(tokens):
         i += step
         name = name.strip()
         ups.append({"amount": amount, "name": ATTR_NAMES.get(name, name), "max": mx})
+    if not any(u["max"] for u in ups):
+        ups, styles = parse_any_order(tokens)
     # same upgrade twice (e.g. repeated blocks) -> keep the first
     seen, unique = set(), []
     for u in ups:
@@ -402,7 +448,10 @@ def training_time(tokens):
     return f"{n} {unit}{'' if n == 1 else 's'}"
 
 
-def build_evo(url, page):
+ASSET_RE = re.compile(r"https?://game-assets\.fut\.gg/[^\"'\s\\)<>]+\.(?:png|webp|jpe?g)", re.I)
+
+
+def build_evo(url, page, card_images=()):
     sections, everything = page_sections(page)
     print(f"DEBUG sections found: {list(sections)}")
     html = page_text(page)
@@ -434,9 +483,22 @@ def build_evo(url, page):
     }
 
     print(f"DEBUG upgrade pieces: {upgrades[:40]}")
+    heading = page.find("h2", string=re.compile(r"evolution upgrades", re.I))
+    box = (heading.find_next_sibling() or heading.parent) if heading else None
+    print(f"DEBUG upgrades html: {str(box)[:1800] if box else 'heading not found'}")
+
     images = img_candidates(page.find("main") or page.body or page)
+    assets = [u for u in dict.fromkeys(ASSET_RE.findall(html.replace("\\/", "/"))) if "event-token" not in u]
+    cards = [u for u in assets if "card" in u.lower()]
     print(f"DEBUG images on evo page: {images[:8]}")
-    evo["image"] = images[0] if images else None
+    print(f"DEBUG game-assets links in page data: {assets[:12]}")
+    evo["image"] = (
+        (images[0] if images else None)
+        or (cards[0] if cards else None)
+        or (card_images[0] if card_images else None)
+        or IMAGE_FALLBACK
+        or None
+    )
 
     if not evo["submit"] and not evo["expiry"]:
         # Nothing found - print what the page does say so it can be fixed
@@ -588,10 +650,7 @@ def load_evo(url, card_images=()):
     except requests.RequestException as e:
         print(f"Could not fetch evo page {url}: {e}")
         return None
-    evo = build_evo(url, page)
-    if not evo["image"] and card_images:
-        evo["image"] = card_images[0]  # fall back to the picture on the listing card
-    return evo
+    return build_evo(url, page, card_images)
 
 
 def post(embeds):
