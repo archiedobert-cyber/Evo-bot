@@ -1,0 +1,96 @@
+name: New Evo alerts
+
+on:
+  schedule:
+    # GitHub cron is UTC and only "best effort": runs are often 10-30 minutes
+    # late. So instead of asking for 6pm, the job STARTS EARLY (about 5:43pm UK),
+    # installs everything, then waits until exactly 6pm UK before posting.
+    # Two crons cover summer (BST) and winter (GMT); the gate step lets through
+    # only the one that matches the current UK clock. An odd minute (43) is used
+    # because ":00" is GitHub's busiest queue slot.
+    - cron: "43 16 * * *"   # 17:23 UK during BST
+    - cron: "43 17 * * *"   # 17:23 UK during GMT
+  workflow_dispatch:       # lets you run it manually from the Actions tab
+    inputs:
+      test:
+        # Ticked = post the first few evos on the page, ignoring the New
+        # label. Unticked = normal run (only posts newly labelled ones).
+        description: "Test"
+        type: boolean
+        default: false
+      test_url:
+        description: "Test a specific evo: paste its fut.gg link (optional)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write          # needed to save posted.json back to the repo
+
+concurrency:
+  group: evo-alerts
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate - only the cron that matches the current UK clock (manual runs always continue)
+        id: gate
+        run: |
+          # Uses which cron fired, not the time it started, so a late start
+          # can't make it skip the day.
+          offset=$(TZ=Europe/London date +%z)
+          schedule="${{ github.event.schedule }}"
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          elif [ "$schedule" = "43 16 * * *" ] && [ "$offset" = "+0100" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          elif [ "$schedule" = "43 17 * * *" ] && [ "$offset" = "+0000" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Wrong DST cron - skipping"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.go == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.go == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+        if: steps.gate.outputs.go == 'true'
+
+      - name: Wait until 6pm UK (scheduled runs only)
+        if: steps.gate.outputs.go == 'true' && github.event_name == 'schedule'
+        run: |
+          target=$(TZ=Europe/London date -d "today 18:00" +%s)
+          now=$(date +%s)
+          if [ "$now" -lt "$target" ]; then
+            echo "Waiting $((target - now)) seconds until 18:00 UK"
+            sleep $((target - now))
+          else
+            echo "Already past 18:00 UK - running now"
+          fi
+
+      - run: python bot.py
+        if: steps.gate.outputs.go == 'true'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PING_ROLE_ID: ${{ secrets.PING_ROLE_ID }}
+          TEST_MODE: ${{ inputs.test && '1' || '' }}
+          TEST_URL: ${{ inputs.test_url }}
+          # Scheduled runs keep re-checking the site for up to 15 minutes after 6pm,
+          # since new content only appears at release time. Manual runs check once.
+          POLL_MINUTES: ${{ github.event_name == 'schedule' && '15' || '' }}
+
+      - name: Save posted list
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add posted.json || true
+          git diff --staged --quiet || (git commit -m "Update posted evolutions" && git pull --rebase && git push)
