@@ -184,6 +184,14 @@ LABELS = {
 }
 
 
+def get_section(sections, name):
+    """Section by heading, tolerating extra text in the heading ('Evolution Upgrades A')."""
+    for key, tokens in sections.items():
+        if key == name or key.startswith(name + " "):
+            return tokens
+    return None
+
+
 def value_after(tokens, label_re):
     """The text piece right after a label ('' if the label or its value is missing)."""
     for i, t in enumerate(tokens):
@@ -221,6 +229,7 @@ def tidy_max(v):
 ATTR_NAMES = {"WF": "Weak Foot", "SM": "Skill Moves", "Fk Accuracy": "FK Accuracy"}
 UPG_FULL = re.compile(r"^\+\s*(\d+)\s+([A-Za-z][A-Za-z .'/-]*?)\s*(\d+)$")  # "+5 OVR80" / "+5 OVR 80"
 UPG_NAME = re.compile(r"^\+\s*(\d+)\s+([A-Za-z][A-Za-z .'/-]*?)$")  # "+5 OVR"
+ICON_WORDS = {"max", "maximum", "cap", "limit", "upgrade", "icon", "arrow", "up", "to"}
 AMOUNT_ONLY = re.compile(r"^\+\s*(\d+)$")  # "+5"
 NAME_ONLY = re.compile(r"^([A-Za-z][A-Za-z .'/-]*?)\s*(\d+)?$")  # "OVR" or "OVR80"
 MAX_ONLY = re.compile(r"^(?:max\.?\s*)?(\d+)$", re.I)  # "80"
@@ -284,9 +293,15 @@ def parse_upgrades(tokens):
             m = UPG_NAME.match(t)
             if m:
                 amount, name = m.groups()
-                nxt = MAX_ONLY.match(tokens[i + 1]) if i + 1 < n else None
-                if nxt:
-                    mx, step = nxt.group(1), 2
+                # the max comes a piece or two later (an icon's label can sit in between)
+                for j in range(i + 1, min(i + 4, n)):
+                    nt = tokens[j]
+                    nxt = MAX_ONLY.match(nt)
+                    if nxt:
+                        mx, step = nxt.group(1), j - i + 1
+                        break
+                    if nt.lower() not in ICON_WORDS:
+                        break
             else:
                 m = AMOUNT_ONLY.match(t)
                 nm = NAME_ONLY.match(tokens[i + 1]) if m and i + 1 < n else None
@@ -304,7 +319,9 @@ def parse_upgrades(tokens):
         name = name.strip()
         ups.append({"amount": amount, "name": ATTR_NAMES.get(name, name), "max": mx})
     if not any(u["max"] for u in ups):
-        ups, styles = parse_any_order(tokens)
+        alt_ups, alt_styles = parse_any_order(tokens)
+        if alt_ups:  # only swap if the fallback actually found something
+            ups, styles = alt_ups, alt_styles
     # same upgrade twice (e.g. repeated blocks) -> keep the first
     seen, unique = set(), []
     for u in ups:
@@ -456,10 +473,10 @@ def build_evo(url, page, card_images=()):
     print(f"DEBUG sections found: {list(sections)}")
     html = page_text(page)
 
-    reqs = sections.get("player requirements") or everything
-    details = sections.get("details") or everything
-    upgrades = sections.get("evolution upgrades") or everything
-    challenges = sections.get("challenges") or everything
+    reqs = get_section(sections, "player requirements") or everything
+    details = get_section(sections, "details") or everything
+    upgrades = get_section(sections, "evolution upgrades") or everything
+    challenges = get_section(sections, "challenges") or everything
 
     ups, styles = parse_upgrades(upgrades)
 
