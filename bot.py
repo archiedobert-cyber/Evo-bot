@@ -74,6 +74,11 @@ UPGRADE_ICON = ""
 # How many upgrades per line
 UPGRADES_PER_LINE = 5
 
+# Where to put the evo's picture: "thumbnail" (small, top right), "image" (big,
+# at the bottom) or "" (no picture). The bot looks for a picture on the evo page,
+# then on its card on the listing page.
+IMAGE_MODE = "thumbnail"
+
 SKIP = ["script", "style", "nav", "header", "footer"]
 
 
@@ -81,6 +86,46 @@ def get(url):
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
     return r.text
+
+
+IMAGE_ATTRS = ("src", "data-src", "data-original", "data-lazy-src", "data-lazy", "data-image", "data-url")
+BAD_IMAGE = ("fut-social", "favicon", "logo", "placeholder", "default-image", "public-assets", "sp.webp")
+
+
+def img_source(img):
+    """Best image URL an <img> tag carries (src, lazy-load attrs, srcset)."""
+    candidates = [img.get(a) for a in IMAGE_ATTRS]
+    srcset = img.get("srcset") or img.get("data-srcset")
+    if srcset:
+        for item in srcset.split(","):
+            parts = item.strip().split()
+            if parts:
+                candidates.append(parts[0])
+    for src in candidates:
+        if not src or src.startswith("data:"):
+            continue
+        src = urljoin(BASE, src.strip())
+        if any(b in src.lower() for b in BAD_IMAGE):
+            continue
+        return src
+    return None
+
+
+def bigger(src):
+    """fut.gg serves resized images (.../width=300/...); ask for a larger one."""
+    return re.sub(r"width=\d+", "width=600", src) if src else src
+
+
+def img_candidates(root):
+    """Every usable picture inside root, in page order (nav/header/footer skipped)."""
+    out = []
+    for img in root.find_all("img"):
+        if img.find_parent(SKIP):
+            continue
+        src = bigger(img_source(img))
+        if src and src not in out:
+            out.append(src)
+    return out
 
 
 def clean_text(s):
@@ -170,33 +215,48 @@ def tidy_max(v):
 
 
 ATTR_NAMES = {"WF": "Weak Foot", "SM": "Skill Moves", "Fk Accuracy": "FK Accuracy"}
-UPG_FULL = re.compile(r"^\+(\d+)\s+([A-Za-z][A-Za-z .'/-]*?)\s*(\d+)$")  # "+5 OVR80"
-UPG_NAME = re.compile(r"^\+(\d+)\s+([A-Za-z][A-Za-z .'/-]*?)$")  # "+5 OVR" (max is the next piece)
+UPG_FULL = re.compile(r"^\+\s*(\d+)\s+([A-Za-z][A-Za-z .'/-]*?)\s*(\d+)$")  # "+5 OVR80" / "+5 OVR 80"
+UPG_NAME = re.compile(r"^\+\s*(\d+)\s+([A-Za-z][A-Za-z .'/-]*?)$")  # "+5 OVR"
+AMOUNT_ONLY = re.compile(r"^\+\s*(\d+)$")  # "+5"
+NAME_ONLY = re.compile(r"^([A-Za-z][A-Za-z .'/-]*?)\s*(\d+)?$")  # "OVR" or "OVR80"
+MAX_ONLY = re.compile(r"^(?:max\.?\s*)?(\d+)$", re.I)  # "80"
 POSITION_PREFIX = re.compile(r"^(?:GK|CB|RB|LB|RWB|LWB|CDM|CM|CAM|RM|LM|RW|LW|CF|ST)(?=[A-Z][a-z])")
 NOT_PLAYSTYLE = re.compile(r"^(?:\d+|[A-Z]|option\s+\w|recommended|pick one|[A-Z]{2,3})$", re.I)
 
 
 def parse_upgrades(tokens):
-    """-> (upgrades [{'amount','name','max'}], playstyles [str])"""
-    ups, styles, i = [], [], 0
-    while i < len(tokens):
+    """-> (upgrades [{'amount','name','max'}], playstyles [str]).
+    Copes with the page giving an upgrade as one piece ("+5 OVR80"), as two
+    ("+5 OVR", "80") or as three ("+5", "OVR", "80")."""
+    ups, styles, i, n = [], [], 0, len(tokens)
+    while i < n:
         t = tokens[i]
+        amount = name = mx = None
+        step = 1
         m = UPG_FULL.match(t)
-        mx = None
         if m:
             amount, name, mx = m.groups()
-            i += 1
         else:
             m = UPG_NAME.match(t)
-            if m and i + 1 < len(tokens) and re.fullmatch(r"\d+", tokens[i + 1]):
+            if m:
                 amount, name = m.groups()
-                mx = tokens[i + 1]
-                i += 2
+                nxt = MAX_ONLY.match(tokens[i + 1]) if i + 1 < n else None
+                if nxt:
+                    mx, step = nxt.group(1), 2
             else:
-                if not NOT_PLAYSTYLE.match(t) and not t.startswith("+"):
-                    styles.append(POSITION_PREFIX.sub("", t))
-                i += 1
-                continue
+                m = AMOUNT_ONLY.match(t)
+                nm = NAME_ONLY.match(tokens[i + 1]) if m and i + 1 < n else None
+                if m and nm:
+                    amount, name, mx = m.group(1), nm.group(1), nm.group(2)
+                    step = 2
+                    if mx is None and i + 2 < n and MAX_ONLY.match(tokens[i + 2]):
+                        mx, step = MAX_ONLY.match(tokens[i + 2]).group(1), 3
+        if amount is None:
+            if not NOT_PLAYSTYLE.match(t) and not t.startswith("+"):
+                styles.append(POSITION_PREFIX.sub("", t))
+            i += 1
+            continue
+        i += step
         name = name.strip()
         ups.append({"amount": amount, "name": ATTR_NAMES.get(name, name), "max": mx})
     # same upgrade twice (e.g. repeated blocks) -> keep the first
@@ -323,6 +383,25 @@ def find_title(page, url):
     return re.sub(r"\s*-\s*EA SPORTS FC.*$", "", title).strip()
 
 
+def number(v):
+    """The value if it is a plain number, else ''."""
+    return v if re.fullmatch(r"\d+", v or "") else ""
+
+
+def training_time(tokens):
+    """'1 day', '3 hours' ... for Training Camp evos, else ''."""
+    m = re.search(
+        r"training time\s*:?\s*(\d+)\s*(weeks?|days?|hours?|hrs?|minutes?|mins?)",
+        " ".join(tokens),
+        re.I,
+    )
+    if not m:
+        return ""
+    n, unit = int(m.group(1)), m.group(2).lower()
+    unit = {"hr": "hour", "hrs": "hour", "min": "minute", "mins": "minute"}.get(unit, unit.rstrip("s"))
+    return f"{n} {unit}{'' if n == 1 else 's'}"
+
+
 def build_evo(url, page):
     sections, everything = page_sections(page)
     print(f"DEBUG sections found: {list(sections)}")
@@ -345,13 +424,19 @@ def build_evo(url, page):
         "excluded": positions_after(reqs, r"excluded positions?"),
         "upgrades": ups,
         "playstyles": styles,
-        "games": value_after(challenges, r"games"),
-        "wins": value_after(challenges, r"wins"),
-        "clean_sheets": value_after(challenges, r"clean sheets"),
+        "training": training_time(everything),
+        "games": number(value_after(challenges, r"games")),
+        "wins": number(value_after(challenges, r"wins")),
+        "clean_sheets": number(value_after(challenges, r"clean sheets")),
         "online": online_required(page),
         "submit": find_deadline(page, html, "Submit by", SUBMIT_KEYS),
         "expiry": find_deadline(page, html, "Expiry", EXPIRY_KEYS),
     }
+
+    print(f"DEBUG upgrade pieces: {upgrades[:40]}")
+    images = img_candidates(page.find("main") or page.body or page)
+    print(f"DEBUG images on evo page: {images[:8]}")
+    evo["image"] = images[0] if images else None
 
     if not evo["submit"] and not evo["expiry"]:
         # Nothing found - print what the page does say so it can be fixed
@@ -362,19 +447,11 @@ def build_evo(url, page):
 
 def upgrade_text(u, icon=""):
     label = f"{icon} +{u['amount']} {u['name']}".strip()
-    return f"**{label}** - Max {u['max']}"
+    return f"**{label}** - Max {u['max']}" if u["max"] else f"**{label}**"
 
 
 def to_embed(evo):
     parts = [f"## 🆕 {evo['title']}\n[More Info]({evo['url']})"]
-
-    cost = []
-    if evo["coins"]:
-        cost.append(f"**Coins** - {evo['coins']}")
-    if evo["points"]:
-        cost.append(f"**Points** - {evo['points']}")
-    if cost:
-        parts.append("## 💰 Cost\n" + "\n".join(cost))
 
     reqs = []
     if evo["overall"]:
@@ -400,15 +477,28 @@ def to_embed(evo):
             block += "\n\n**Playstyles**\n" + ", ".join(evo["playstyles"])
         parts.append(block)
 
+    # Challenges depend on the kind of evo:
+    #  - Training Camp: shows how long it takes instead of games
+    #  - standard: games / wins / clean sheets / online
+    #  - cosmetic (nothing to play or wait for): no Challenges section at all
     chal = []
-    if evo["games"]:
-        chal.append(f"**Games** - {evo['games']}")
-    if evo["wins"]:
-        chal.append(f"**Wins** - {evo['wins']}")
-    if evo["clean_sheets"]:
-        chal.append(f"**Clean Sheets** - {evo['clean_sheets']}")
-    chal.append(f"**Online Required** - {'✅' if evo['online'] else '❌'}")
-    parts.append("## 📋 Challenges\n" + "\n".join(chal))
+    if evo["training"]:
+        chal.append(f"**Training Time** - {evo['training']}")
+    elif any(v not in ("", "0") for v in (evo["games"], evo["wins"], evo["clean_sheets"])):
+        chal.append(f"**Games** - {evo['games'] or 0}")
+        chal.append(f"**Wins** - {evo['wins'] or 0}")
+        chal.append(f"**Clean Sheets** - {evo['clean_sheets'] or 0}")
+        chal.append(f"**Online Required** - {'✅' if evo['online'] else '❌'}")
+    if chal:
+        parts.append("## 📋 Challenges\n" + "\n".join(chal))
+
+    cost = []
+    if evo["coins"]:
+        cost.append(f"**Coins** - {evo['coins']}")
+    if evo["points"]:
+        cost.append(f"**Points** - {evo['points']}")
+    if cost:
+        parts.append("## 💰 Cost\n" + "\n".join(cost))
 
     avail = []
     if evo["submit"]:
@@ -419,6 +509,9 @@ def to_embed(evo):
         parts.append("## ⏰ Available For\n" + "\n".join(avail))
 
     embed = {"description": "\n\n".join(parts)[:4000], "color": 0x3498DB}
+
+    if evo.get("image") and IMAGE_MODE in ("thumbnail", "image"):
+        embed[IMAGE_MODE] = {"url": evo["image"]}
 
     print("DEBUG EMBED:")
     print(json.dumps(embed, indent=2, ensure_ascii=False))
@@ -448,7 +541,7 @@ def card_info(anchor):
         for t in card.find_all(string=True)
         if not t.find_parent(["script", "style"])
     ) or any(NEW_SUFFIX.search(a.get_text("", strip=True)) for a in card.find_all("a"))
-    return {"new": is_new, "text": card.get_text(" ", strip=True)}
+    return {"new": is_new, "text": card.get_text(" ", strip=True), "images": img_candidates(card)}
 
 
 def find_evo_links(html):
@@ -461,13 +554,14 @@ def find_evo_links(html):
         old = found.get(url)
         if old:
             info["new"] = info["new"] or old["new"]
+            info["images"] = old["images"] + [i for i in info["images"] if i not in old["images"]]
         found[url] = info
     if not found:
         sys.exit("No evo cards found - the page layout may have changed.")
     new_count = sum(i["new"] for i in found.values())
     print(f"Found {len(found)} evos on the page, {new_count} labelled New")
     for url, i in list(found.items())[:3]:
-        print(f"DEBUG card {url}: new={i['new']} text={i['text'][:150]!r}")
+        print(f"DEBUG card {url}: new={i['new']} text={i['text'][:150]!r} images={i['images'][:3]}")
     return found
 
 
@@ -488,13 +582,16 @@ def save_state(new_urls):
     STATE_FILE.write_text(json.dumps({"new": sorted(new_urls)}, indent=2))
 
 
-def load_evo(url):
+def load_evo(url, card_images=()):
     try:
         page = BeautifulSoup(get(url), "html.parser")
     except requests.RequestException as e:
         print(f"Could not fetch evo page {url}: {e}")
         return None
-    return build_evo(url, page)
+    evo = build_evo(url, page)
+    if not evo["image"] and card_images:
+        evo["image"] = card_images[0]  # fall back to the picture on the listing card
+    return evo
 
 
 def post(embeds):
@@ -535,7 +632,7 @@ def main():
         # Prefer evos labelled New; if none are, use the first few on the page
         new_urls = [u for u, i in found.items() if i["new"]][:TEST_LIMIT] or list(found)[:TEST_LIMIT]
         print(f"Test mode - posting {len(new_urls)} evo(s), ignoring what was posted before")
-        new = [e for e in (load_evo(u) for u in new_urls) if e]
+        new = [e for e in (load_evo(u, found[u]["images"]) for u in new_urls) if e]
         embeds = [to_embed(e) for e in new]
         if DRY_RUN:
             print(json.dumps(embeds, indent=2, ensure_ascii=False))
@@ -557,7 +654,7 @@ def main():
         new_urls = [u for u in found if u in labelled and u not in previous]
         print(f"{len(new_urls)} evo(s) to post")
 
-        new = [e for e in (load_evo(u) for u in new_urls) if e]
+        new = [e for e in (load_evo(u, found[u]["images"]) for u in new_urls) if e]
         if new or time.time() >= deadline:
             break
         print(f"Nothing new yet - checking again in {POLL_EVERY}s")
