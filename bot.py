@@ -74,14 +74,9 @@ UPGRADE_ICON = ""
 # How many upgrades per line
 UPGRADES_PER_LINE = 5
 
-# Where to put the evo's picture: "thumbnail" (small, top right), "image" (big,
-# at the bottom) or "" (no picture). The bot looks for a picture on the evo page,
-# then on its card on the listing page.
-IMAGE_MODE = "thumbnail"
-
-# Optional picture to use when the bot can't find one for an evo, e.g. a link to an
-# image you've uploaded to the repo or Discord. "" = no picture in that case.
-IMAGE_FALLBACK = ""
+# Small picture in the top right of each post. Discord needs a link to an image, so
+# this is the 🧬 emoji as a picture (from Twemoji). Swap in any image link, or "" for none.
+THUMBNAIL_URL = "https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/1f9ec.png"
 
 SKIP = ["script", "style", "nav", "header", "footer"]
 
@@ -90,46 +85,6 @@ def get(url):
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
     return r.text
-
-
-IMAGE_ATTRS = ("src", "data-src", "data-original", "data-lazy-src", "data-lazy", "data-image", "data-url")
-BAD_IMAGE = ("fut-social", "favicon", "logo", "placeholder", "default-image", "public-assets", "sp.webp")
-
-
-def img_source(img):
-    """Best image URL an <img> tag carries (src, lazy-load attrs, srcset)."""
-    candidates = [img.get(a) for a in IMAGE_ATTRS]
-    srcset = img.get("srcset") or img.get("data-srcset")
-    if srcset:
-        for item in srcset.split(","):
-            parts = item.strip().split()
-            if parts:
-                candidates.append(parts[0])
-    for src in candidates:
-        if not src or src.startswith("data:"):
-            continue
-        src = urljoin(BASE, src.strip())
-        if any(b in src.lower() for b in BAD_IMAGE):
-            continue
-        return src
-    return None
-
-
-def bigger(src):
-    """fut.gg serves resized images (.../width=300/...); ask for a larger one."""
-    return re.sub(r"width=\d+", "width=600", src) if src else src
-
-
-def img_candidates(root):
-    """Every usable picture inside root, in page order (nav/header/footer skipped)."""
-    out = []
-    for img in root.find_all("img"):
-        if img.find_parent(SKIP):
-            continue
-        src = bigger(img_source(img))
-        if src and src not in out:
-            out.append(src)
-    return out
 
 
 def clean_text(s):
@@ -277,10 +232,24 @@ def parse_any_order(tokens):
     return ups, styles
 
 
+def merge_plus(tokens):
+    """The page can give '+5' as two pieces, '+' and '5'. Stick them back together."""
+    out, i = [], 0
+    while i < len(tokens):
+        if tokens[i] == "+" and i + 1 < len(tokens) and re.match(r"^\d+\b", tokens[i + 1]):
+            out.append("+" + tokens[i + 1])
+            i += 2
+        else:
+            out.append(tokens[i])
+            i += 1
+    return out
+
+
 def parse_upgrades(tokens):
     """-> (upgrades [{'amount','name','max'}], playstyles [str]).
     Copes with the page giving an upgrade as one piece ("+5 OVR80"), as two
     ("+5 OVR", "80") or as three ("+5", "OVR", "80")."""
+    tokens = merge_plus(tokens)
     ups, styles, i, n = [], [], 0, len(tokens)
     while i < n:
         t = tokens[i]
@@ -308,8 +277,14 @@ def parse_upgrades(tokens):
                 if m and nm:
                     amount, name, mx = m.group(1), nm.group(1), nm.group(2)
                     step = 2
-                    if mx is None and i + 2 < n and MAX_ONLY.match(tokens[i + 2]):
-                        mx, step = MAX_ONLY.match(tokens[i + 2]).group(1), 3
+                    if mx is None:
+                        for j in range(i + 2, min(i + 5, n)):
+                            nxt = MAX_ONLY.match(tokens[j])
+                            if nxt:
+                                mx, step = nxt.group(1), j - i + 1
+                                break
+                            if tokens[j].lower() not in ICON_WORDS:
+                                break
         if amount is None:
             if not NOT_PLAYSTYLE.match(t) and not t.startswith("+"):
                 styles.append(POSITION_PREFIX.sub("", t))
@@ -465,10 +440,7 @@ def training_time(tokens):
     return f"{n} {unit}{'' if n == 1 else 's'}"
 
 
-ASSET_RE = re.compile(r"https?://game-assets\.fut\.gg/[^\"'\s\\)<>]+\.(?:png|webp|jpe?g)", re.I)
-
-
-def build_evo(url, page, card_images=()):
+def build_evo(url, page):
     sections, everything = page_sections(page)
     print(f"DEBUG sections found: {list(sections)}")
     html = page_text(page)
@@ -503,19 +475,6 @@ def build_evo(url, page, card_images=()):
     heading = page.find("h2", string=re.compile(r"evolution upgrades", re.I))
     box = (heading.find_next_sibling() or heading.parent) if heading else None
     print(f"DEBUG upgrades html: {str(box)[:1800] if box else 'heading not found'}")
-
-    images = img_candidates(page.find("main") or page.body or page)
-    assets = [u for u in dict.fromkeys(ASSET_RE.findall(html.replace("\\/", "/"))) if "event-token" not in u]
-    cards = [u for u in assets if "card" in u.lower()]
-    print(f"DEBUG images on evo page: {images[:8]}")
-    print(f"DEBUG game-assets links in page data: {assets[:12]}")
-    evo["image"] = (
-        (images[0] if images else None)
-        or (cards[0] if cards else None)
-        or (card_images[0] if card_images else None)
-        or IMAGE_FALLBACK
-        or None
-    )
 
     if not evo["submit"] and not evo["expiry"]:
         # Nothing found - print what the page does say so it can be fixed
@@ -589,8 +548,8 @@ def to_embed(evo):
 
     embed = {"description": "\n\n".join(parts)[:4000], "color": 0x3498DB}
 
-    if evo.get("image") and IMAGE_MODE in ("thumbnail", "image"):
-        embed[IMAGE_MODE] = {"url": evo["image"]}
+    if THUMBNAIL_URL:
+        embed["thumbnail"] = {"url": THUMBNAIL_URL}
 
     print("DEBUG EMBED:")
     print(json.dumps(embed, indent=2, ensure_ascii=False))
@@ -620,7 +579,7 @@ def card_info(anchor):
         for t in card.find_all(string=True)
         if not t.find_parent(["script", "style"])
     ) or any(NEW_SUFFIX.search(a.get_text("", strip=True)) for a in card.find_all("a"))
-    return {"new": is_new, "text": card.get_text(" ", strip=True), "images": img_candidates(card)}
+    return {"new": is_new, "text": card.get_text(" ", strip=True)}
 
 
 def find_evo_links(html):
@@ -633,14 +592,13 @@ def find_evo_links(html):
         old = found.get(url)
         if old:
             info["new"] = info["new"] or old["new"]
-            info["images"] = old["images"] + [i for i in info["images"] if i not in old["images"]]
         found[url] = info
     if not found:
         sys.exit("No evo cards found - the page layout may have changed.")
     new_count = sum(i["new"] for i in found.values())
     print(f"Found {len(found)} evos on the page, {new_count} labelled New")
     for url, i in list(found.items())[:3]:
-        print(f"DEBUG card {url}: new={i['new']} text={i['text'][:150]!r} images={i['images'][:3]}")
+        print(f"DEBUG card {url}: new={i['new']} text={i['text'][:150]!r}")
     return found
 
 
@@ -661,13 +619,13 @@ def save_state(new_urls):
     STATE_FILE.write_text(json.dumps({"new": sorted(new_urls)}, indent=2))
 
 
-def load_evo(url, card_images=()):
+def load_evo(url):
     try:
         page = BeautifulSoup(get(url), "html.parser")
     except requests.RequestException as e:
         print(f"Could not fetch evo page {url}: {e}")
         return None
-    return build_evo(url, page, card_images)
+    return build_evo(url, page)
 
 
 def post(embeds):
@@ -708,7 +666,7 @@ def main():
         # Prefer evos labelled New; if none are, use the first few on the page
         new_urls = [u for u, i in found.items() if i["new"]][:TEST_LIMIT] or list(found)[:TEST_LIMIT]
         print(f"Test mode - posting {len(new_urls)} evo(s), ignoring what was posted before")
-        new = [e for e in (load_evo(u, found[u]["images"]) for u in new_urls) if e]
+        new = [e for e in (load_evo(u) for u in new_urls) if e]
         embeds = [to_embed(e) for e in new]
         if DRY_RUN:
             print(json.dumps(embeds, indent=2, ensure_ascii=False))
@@ -730,7 +688,7 @@ def main():
         new_urls = [u for u in found if u in labelled and u not in previous]
         print(f"{len(new_urls)} evo(s) to post")
 
-        new = [e for e in (load_evo(u, found[u]["images"]) for u in new_urls) if e]
+        new = [e for e in (load_evo(u) for u in new_urls) if e]
         if new or time.time() >= deadline:
             break
         print(f"Nothing new yet - checking again in {POLL_EVERY}s")
