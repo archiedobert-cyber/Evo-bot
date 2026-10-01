@@ -58,7 +58,7 @@ POLL_EVERY = 20
 TEST_LIMIT = 3
 
 # Title line shown above the evo cards - edit the text/emojis however you like
-HEADER = "# 🚨 🆕 **NEW EVO** 🆕 🚨"
+HEADER = "# 🚨 🧬 **NEW EVOLUTION** 🧬 🚨"
 
 # Message posted at the very bottom, after all the cards. "" = no footer.
 FOOTER = ""
