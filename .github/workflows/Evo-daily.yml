@@ -32,10 +32,6 @@ jobs:
           schedule="${{ github.event.schedule }}"
           if [ "${{ github.event_name }}" != "schedule" ]; then
             echo "go=true" >> "$GITHUB_OUTPUT"
-          elif [ "$schedule" = "43 16 * * *" ] && [ "$offset" = "+0100" ]; then
-            echo "go=true" >> "$GITHUB_OUTPUT"
-          elif [ "$schedule" = "43 17 * * *" ] && [ "$offset" = "+0000" ]; then
-            echo "go=true" >> "$GITHUB_OUTPUT"
           else
             echo "Wrong DST cron - skipping"
             echo "go=false" >> "$GITHUB_OUTPUT"
