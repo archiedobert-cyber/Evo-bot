@@ -1,25 +1,14 @@
 name: New Evo alerts
 
 on:
-  schedule:
-    # GitHub cron is UTC and only "best effort": runs are often 10-30 minutes
-    # late. So instead of asking for 6pm, the job STARTS EARLY (about 5:43pm UK),
-    # installs everything, then waits until exactly 6pm UK before posting.
-    # Two crons cover summer (BST) and winter (GMT); the gate step lets through
-    # only the one that matches the current UK clock. An odd minute (43) is used
-    # because ":00" is GitHub's busiest queue slot.
-    - cron: "43 16 * * *"   # 17:23 UK during BST
-    - cron: "43 17 * * *"   # 17:23 UK during GMT
-  workflow_dispatch:       # lets you run it manually from the Actions tab
+  workflow_dispatch:
     inputs:
       test:
-        # Ticked = post the first few evos on the page, ignoring the New
-        # label. Unticked = normal run (only posts newly labelled ones).
-        description: "Test"
+        description: "Test mode"
         type: boolean
         default: false
       test_url:
-        description: "Test a specific evo: paste its fut.gg link (optional)"
+        description: "Test URL"
         type: string
         default: ""
 
