@@ -23,57 +23,26 @@ jobs:
   post:
     runs-on: ubuntu-latest
     steps:
-      - name: Gate - only the cron that matches the current UK clock (manual runs always continue)
-        id: gate
-        run: |
-          # Uses which cron fired, not the time it started, so a late start
-          # can't make it skip the day.
-          offset=$(TZ=Europe/London date +%z)
-          schedule="${{ github.event.schedule }}"
-          if [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "go=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Wrong DST cron - skipping"
-            echo "go=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/checkout@v4
-        if: steps.gate.outputs.go == 'true'
 
       - uses: actions/setup-python@v5
-        if: steps.gate.outputs.go == 'true'
         with:
           python-version: "3.12"
           cache: pip
 
       - run: pip install -r requirements.txt
-        if: steps.gate.outputs.go == 'true'
-
-      - name: Wait until 6pm UK (scheduled runs only)
-        if: steps.gate.outputs.go == 'true' && github.event_name == 'schedule'
-        run: |
-          target=$(TZ=Europe/London date -d "today 18:00" +%s)
-          now=$(date +%s)
-          if [ "$now" -lt "$target" ]; then
-            echo "Waiting $((target - now)) seconds until 18:00 UK"
-            sleep $((target - now))
-          else
-            echo "Already past 18:00 UK - running now"
-          fi
 
       - run: python bot.py
-        if: steps.gate.outputs.go == 'true'
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           PING_ROLE_ID: ${{ secrets.PING_ROLE_ID }}
           TEST_MODE: ${{ inputs.test && '1' || '' }}
           TEST_URL: ${{ inputs.test_url }}
-          # Scheduled runs keep re-checking the site for up to 15 minutes after 6pm,
-          # since new content only appears at release time. Manual runs check once.
-          POLL_MINUTES: ${{ github.event_name == 'schedule' && '15' || '' }}
+          # Real runs keep re-checking the site for up to 15 minutes, since new
+          # content only appears at release time. Test runs check once.
+          POLL_MINUTES: ${{ !inputs.test && '15' || '' }}
 
       - name: Save posted list
-        if: steps.gate.outputs.go == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
