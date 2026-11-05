@@ -36,6 +36,8 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           PING_ROLE_ID: ${{ secrets.PING_ROLE_ID }}
+          DISCORD_WEBHOOK_URL_2: ${{ secrets.DISCORD_WEBHOOK_URL_2 }}
+          PING_ROLE_ID_2: ${{ secrets.PING_ROLE_ID_2 }}
           TEST_MODE: ${{ inputs.test && '1' || '' }}
           TEST_URL: ${{ inputs.test_url }}
           # Real runs keep re-checking the site for up to 15 minutes, since new
@@ -43,6 +45,7 @@ jobs:
           POLL_MINUTES: ${{ !inputs.test && '15' || '' }}
 
       - name: Save posted list
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
