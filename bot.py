@@ -1,4 +1,4 @@
-"""Posts evolutions labelled "New" on fut.gg/evolutions to a Discord channel via webhook.
+"""Posts evolutions labelled "New" on fut.gg/evolutions to Discord channels via webhook.
 
 An evo is posted when it shows the "New" label now but did not show it at the
 previous run. So an evo that keeps its label for several days is posted once,
@@ -6,11 +6,19 @@ and one that comes back with the label again is posted again. posted.json only
 remembers which evos were labelled New last time.
 
 Env vars (same names as the other bots, so the same workflow file works):
-  DISCORD_WEBHOOK_URL  webhook to post to (GitHub secret)
-  PING_ROLE_ID         optional role ID to ping after the post (GitHub secret)
-  DRY_RUN=1            print what would be posted instead of sending it
-  TEST_MODE=1          post the evos currently labelled New (or the first few on the page if none), even if already posted
-  TEST_URL=<link>      post just this one evo page, skipping the site scan
+  DISCORD_WEBHOOK_URL    webhook to post to - server 1 (GitHub secret)
+  PING_ROLE_ID           optional role ID to ping after the post in server 1 (GitHub secret)
+  DISCORD_WEBHOOK_URL_2  second webhook - server 2 (optional GitHub secret)
+  PING_ROLE_ID_2         optional role ID to ping in server 2 (GitHub secret)
+  DRY_RUN=1              print what would be posted instead of sending it
+  TEST_MODE=1            post the evos currently labelled New (or the first few
+                         on the page if none) to every server, even if already
+                         posted
+  TEST_URL=<link>        post just this one evo page to server 1 only, skipping
+                         the site scan
+
+The name and picture each post appears under are the ones set on the Discord
+webhook itself; this script does not override them.
 """
 import json
 import os
@@ -28,7 +36,19 @@ from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 BASE = "https://www.fut.gg"
 LIST_URL = f"{BASE}/evolutions/"
 STATE_FILE = Path("posted.json")  # remembers what's already been posted
-WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
+
+# Each destination is (webhook_url, role_id_to_ping). Server 2 is used only if
+# its webhook secret is set; leave it unset and the bot posts to server 1 only.
+_RAW_DESTINATIONS = [
+    (os.environ.get("DISCORD_WEBHOOK_URL"), os.environ.get("PING_ROLE_ID")),
+    (os.environ.get("DISCORD_WEBHOOK_URL_2"), os.environ.get("PING_ROLE_ID_2")),
+]
+DESTINATIONS = [
+    (url.strip(), (role or "").strip() or None)
+    for url, role in _RAW_DESTINATIONS
+    if url and url.strip()
+]
+
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 TEST_MODE = os.environ.get("TEST_MODE") == "1"
 TEST_URL = os.environ.get("TEST_URL", "").strip()
@@ -62,10 +82,6 @@ HEADER = "# 🚨 🧬 **NEW EVOLUTION** 🧬 🚨"
 
 # Message posted at the very bottom, after all the cards. "" = no footer.
 FOOTER = ""
-
-# Role to ping after the post. Set as a GitHub secret named PING_ROLE_ID
-# (numbers only) or paste the ID here. "" = no ping.
-PING_ROLE_ID = os.environ.get("PING_ROLE_ID", "").strip()
 
 # Emoji shown in front of each upgrade (not the OVR one, which always gets ⭐️).
 # "" = none. Example: "🔹"
@@ -628,27 +644,57 @@ def load_evo(url):
     return build_evo(url, page)
 
 
-def post(embeds):
+# --------------------------------------------------------------------------
+# Sending
+# --------------------------------------------------------------------------
+
+def post_message(url, payload):
+    """Post one message to one webhook. The name and picture shown are the
+    ones set on the webhook itself. Waits and retries if Discord rate limits."""
+    for _ in range(3):
+        r = requests.post(url, json=payload, timeout=30)
+        if r.status_code == 429:
+            time.sleep(float(r.json().get("retry_after", 2)))
+            continue
+        r.raise_for_status()
+        return
+    raise RuntimeError("Discord kept rate limiting this webhook.")
+
+
+def post_to_one(url, role_id, embeds):
+    """Send the full set of evo cards (and the role ping / footer) to one server."""
     for i in range(0, len(embeds), 10):  # Discord allows 10 embeds per message
         payload = {"embeds": embeds[i : i + 10]}
         if i == 0:
             payload["content"] = HEADER
-        r = requests.post(WEBHOOK, json=payload, timeout=30)
-        r.raise_for_status()
+        post_message(url, payload)
         time.sleep(1)
 
-    if FOOTER or PING_ROLE_ID:
-        content = f"<@&{PING_ROLE_ID}> {FOOTER}".strip() if PING_ROLE_ID else FOOTER
+    if FOOTER or role_id:
+        content = f"<@&{role_id}> {FOOTER}".strip() if role_id else FOOTER
         # flags=4 stops Discord adding a big link preview under the footer
         payload = {"content": content, "flags": 4}
-        if PING_ROLE_ID:  # only this role can be pinged, nothing else
-            payload["allowed_mentions"] = {"roles": [PING_ROLE_ID]}
-        r = requests.post(WEBHOOK, json=payload, timeout=30)
-        r.raise_for_status()
+        if role_id:  # only this role can be pinged, nothing else
+            payload["allowed_mentions"] = {"roles": [role_id]}
+        post_message(url, payload)
+
+
+def send_everywhere(embeds, destinations):
+    """Post to each server in turn. One server failing doesn't stop the others.
+    Returns a list of error messages (empty if everything worked)."""
+    errors = []
+    for n, (url, role_id) in enumerate(destinations, start=1):
+        try:
+            post_to_one(url, role_id, embeds)
+            print(f"Server {n}: posted.")
+        except Exception as exc:
+            # Only the error type is logged, so a webhook URL never appears in the log.
+            errors.append(f"Server {n} failed: {type(exc).__name__}")
+    return errors
 
 
 def main():
-    if not WEBHOOK and not DRY_RUN:
+    if not DESTINATIONS and not DRY_RUN:
         sys.exit("DISCORD_WEBHOOK_URL is not set")
 
     if TEST_URL:
@@ -658,7 +704,10 @@ def main():
         if DRY_RUN:
             print(json.dumps([embed], indent=2, ensure_ascii=False))
         else:
-            post([embed])
+            # Test posts for a single page go to the first server only.
+            errors = send_everywhere([embed], DESTINATIONS[:1])
+            if errors:
+                sys.exit("; ".join(errors))
         return
 
     if TEST_MODE:
@@ -671,7 +720,9 @@ def main():
         if DRY_RUN:
             print(json.dumps(embeds, indent=2, ensure_ascii=False))
         elif embeds:
-            post(embeds)
+            errors = send_everywhere(embeds, DESTINATIONS)
+            if errors:
+                sys.exit("; ".join(errors))
         return
 
     previous = load_state()
@@ -694,15 +745,23 @@ def main():
         print(f"Nothing new yet - checking again in {POLL_EVERY}s")
         time.sleep(POLL_EVERY)
 
+    errors = []
     if new:
         embeds = [to_embed(e) for e in new]
         if DRY_RUN:
             print(json.dumps(embeds, indent=2, ensure_ascii=False))
         else:
-            post(embeds)
+            errors = send_everywhere(embeds, DESTINATIONS)
 
     if not DRY_RUN:
-        save_state(labelled)  # only reached if posting didn't fail
+        # Save the "labelled New" list if nothing needed posting, or if at least
+        # one server received the post - so a re-run doesn't repost to a server
+        # that already got it. If every server failed, nothing is saved and the
+        # next run tries again.
+        if not new or len(errors) < len(DESTINATIONS):
+            save_state(labelled)
+        if errors:
+            sys.exit("; ".join(errors))
 
 
 if __name__ == "__main__":
