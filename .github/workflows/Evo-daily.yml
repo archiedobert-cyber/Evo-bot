@@ -11,6 +11,14 @@ on:
         description: "Test URL"
         type: string
         default: ""
+      test_target:
+        description: "Where test runs are sent"
+        type: choice
+        options:
+          - both
+          - server 1
+          - server 2
+        default: both
 
 permissions:
   contents: write          # needed to save posted.json back to the repo
@@ -40,6 +48,7 @@ jobs:
           PING_ROLE_ID_2: ${{ secrets.PING_ROLE_ID_2 }}
           TEST_MODE: ${{ inputs.test && '1' || '' }}
           TEST_URL: ${{ inputs.test_url }}
+          TEST_TARGET: ${{ inputs.test_target }}
           # Real runs keep re-checking the site for up to 15 minutes, since new
           # content only appears at release time. Test runs check once.
           POLL_MINUTES: ${{ !inputs.test && '15' || '' }}
