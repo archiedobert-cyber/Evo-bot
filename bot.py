@@ -3,7 +3,7 @@
 An evo is posted when it shows the "New" label now but did not show it at the
 previous run. So an evo that keeps its label for several days is posted once,
 and one that comes back with the label again is posted again. posted.json only
-remembers which evos were labelled New last time.
+remembers which evos were labelled New last time (and anything posted by a test run).
 
 Env vars (same names as the other bots, so the same workflow file works):
   DISCORD_WEBHOOK_URL    webhook to post to - server 1 (GitHub secret)
@@ -17,6 +17,8 @@ Env vars (same names as the other bots, so the same workflow file works):
   TEST_TARGET=<where>    which server(s) a test run is sent to: both, "server 1"
                          or "server 2" (the 'Where test runs are sent' dropdown).
                          Live runs always post to every server.
+  SEED_ONLY=1            mark everything currently labelled New as already posted,
+                         without sending anything (use once to clear a backlog)
 
 The name and picture each post appears under are the ones set on the Discord
 webhook itself; this script does not override them.
@@ -74,6 +76,7 @@ TEST_DESTINATIONS = _pick_test_destinations()
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 TEST_MODE = os.environ.get("TEST_MODE") == "1"
 TEST_URL = os.environ.get("TEST_URL", "").strip()
+SEED_ONLY = os.environ.get("SEED_ONLY") == "1"
 
 HEADERS = {
     "User-Agent": (
@@ -98,6 +101,14 @@ POLL_EVERY = 20
 
 # In test mode, how many evos from the top of the page to post
 TEST_LIMIT = 3
+
+# Max evos posted per real run. Anything over this waits for the next run,
+# so a big backlog is cleared a few at a time instead of all at once.
+MAX_PER_RUN = 5
+
+# Discord rejects a message whose embeds add up to more than 6000 characters,
+# so evo cards are split across several messages to stay under this.
+MAX_EMBED_CHARS = 5000
 
 # Title line shown above the evo cards - edit the text/emojis however you like
 HEADER = "# 🚨 🧬 **NEW EVOLUTION** 🧬 🚨"
@@ -657,6 +668,11 @@ def save_state(new_urls):
     STATE_FILE.write_text(json.dumps({"new": sorted(new_urls)}, indent=2))
 
 
+def remember(urls):
+    """Add these evo URLs to posted.json so a real run won't post them again."""
+    save_state((load_state() or set()) | set(urls))
+
+
 def load_evo(url):
     try:
         page = BeautifulSoup(get(url), "html.parser")
@@ -683,10 +699,24 @@ def post_message(url, payload):
     raise RuntimeError("Discord kept rate limiting this webhook.")
 
 
+def chunk_embeds(embeds):
+    """Split embeds into messages of <=10 embeds and <=MAX_EMBED_CHARS characters."""
+    batch, size = [], 0
+    for e in embeds:
+        n = len(e.get("description", "")) + len(e.get("title", ""))
+        if batch and (len(batch) >= 10 or size + n > MAX_EMBED_CHARS):
+            yield batch
+            batch, size = [], 0
+        batch.append(e)
+        size += n
+    if batch:
+        yield batch
+
+
 def post_to_one(url, role_id, embeds):
     """Send the full set of evo cards (and the role ping / footer) to one server."""
-    for i in range(0, len(embeds), 10):  # Discord allows 10 embeds per message
-        payload = {"embeds": embeds[i : i + 10]}
+    for i, batch in enumerate(chunk_embeds(embeds)):
+        payload = {"embeds": batch}
         if i == 0:
             payload["content"] = HEADER
         post_message(url, payload)
@@ -709,6 +739,11 @@ def send_everywhere(embeds, destinations):
         try:
             post_to_one(url, role_id, embeds)
             print(f"Server {n}: posted.")
+        except requests.HTTPError as exc:
+            r = exc.response
+            # Print Discord's reason (never the webhook URL)
+            print(f"Server {n}: Discord said {r.status_code}: {r.text[:300]}")
+            errors.append(f"Server {n} failed: HTTP {r.status_code}")
         except Exception as exc:
             # Only the error type is logged, so a webhook URL never appears in the log.
             errors.append(f"Server {n} failed: {type(exc).__name__}")
@@ -716,9 +751,18 @@ def send_everywhere(embeds, destinations):
 
 
 def main():
+    # One-off: treat everything currently labelled New as already posted
+    if SEED_ONLY:
+        found = find_evo_links(get(LIST_URL))
+        labelled = {u for u, i in found.items() if i["new"]}
+        save_state(labelled)
+        print(f"Seeded {len(labelled)} evo(s) as already posted. Nothing sent.")
+        return
+
     if not DESTINATIONS and not DRY_RUN:
         sys.exit("DISCORD_WEBHOOK_URL is not set")
 
+    # ---- test: one specific evo ----
     if TEST_URL:
         print(f"TEST_URL set - posting just this one evo: {TEST_URL}")
         page = BeautifulSoup(get(TEST_URL), "html.parser")
@@ -728,10 +772,13 @@ def main():
         else:
             # Test posts go where the 'Where test runs are sent' dropdown says.
             errors = send_everywhere([embed], TEST_DESTINATIONS)
+            if len(errors) < len(TEST_DESTINATIONS):
+                remember([TEST_URL])  # saved, so a real run won't post it again
             if errors:
                 sys.exit("; ".join(errors))
         return
 
+    # ---- test: the evos currently labelled New ----
     if TEST_MODE:
         found = find_evo_links(get(LIST_URL))
         # Prefer evos labelled New; if none are, use the first few on the page
@@ -743,10 +790,13 @@ def main():
             print(json.dumps(embeds, indent=2, ensure_ascii=False))
         elif embeds:
             errors = send_everywhere(embeds, TEST_DESTINATIONS)
+            if len(errors) < len(TEST_DESTINATIONS):
+                remember([e["url"] for e in new])  # saved, so a real run won't repeat them
             if errors:
                 sys.exit("; ".join(errors))
         return
 
+    # ---- real run ----
     previous = load_state()
     if previous is None:
         print("First run - posting everything currently labelled New")
@@ -759,9 +809,16 @@ def main():
         found = find_evo_links(get(LIST_URL))
         labelled = {u for u, i in found.items() if i["new"]}
         new_urls = [u for u in found if u in labelled and u not in previous]
-        print(f"{len(new_urls)} evo(s) to post")
+        batch_urls = new_urls[:MAX_PER_RUN]
+        if len(new_urls) > MAX_PER_RUN:
+            print(
+                f"{len(new_urls)} evo(s) to post - doing {MAX_PER_RUN} now, "
+                f"{len(new_urls) - MAX_PER_RUN} left for the next run"
+            )
+        else:
+            print(f"{len(new_urls)} evo(s) to post")
 
-        new = [e for e in (load_evo(u) for u in new_urls) if e]
+        new = [e for e in (load_evo(u) for u in batch_urls) if e]
         if new or time.time() >= deadline:
             break
         print(f"Nothing new yet - checking again in {POLL_EVERY}s")
@@ -776,12 +833,12 @@ def main():
             errors = send_everywhere(embeds, DESTINATIONS)
 
     if not DRY_RUN:
-        # Save the "labelled New" list if nothing needed posting, or if at least
-        # one server received the post - so a re-run doesn't repost to a server
-        # that already got it. If every server failed, nothing is saved and the
-        # next run tries again.
+        # Remember what was already known plus what was just posted. Evos that
+        # were skipped (over the cap) or failed to load are NOT remembered, so
+        # the next run picks them up. If every server failed, nothing is saved.
         if not new or len(errors) < len(DESTINATIONS):
-            save_state(labelled)
+            posted_now = {e["url"] for e in new}
+            save_state((labelled & previous) | posted_now)
         if errors:
             sys.exit("; ".join(errors))
 
