@@ -100,11 +100,11 @@ POLL_MINUTES = float(os.environ.get("POLL_MINUTES") or 0)
 POLL_EVERY = 20
 
 # In test mode, how many evos from the top of the page to post
-TEST_LIMIT = 3
+TEST_LIMIT = 10
 
 # Max evos posted per real run. Anything over this waits for the next run,
 # so a big backlog is cleared a few at a time instead of all at once.
-MAX_PER_RUN = 5
+MAX_PER_RUN = 10
 
 # Discord rejects a message whose embeds add up to more than 6000 characters,
 # so evo cards are split across several messages to stay under this.
