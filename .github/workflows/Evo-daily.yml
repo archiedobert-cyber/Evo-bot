@@ -19,6 +19,10 @@ on:
           - server 1
           - server 2
         default: both
+      seed_only:
+        description: "Mark everything currently on the site as posted (sends nothing)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write          # needed to save posted.json back to the repo
@@ -49,6 +53,7 @@ jobs:
           TEST_MODE: ${{ inputs.test && '1' || '' }}
           TEST_URL: ${{ inputs.test_url }}
           TEST_TARGET: ${{ inputs.test_target }}
+          SEED_ONLY: ${{ inputs.seed_only && '1' || '' }}
           # Real runs keep re-checking the site for up to 15 minutes, since new
           # content only appears at release time. Test runs check once.
           POLL_MINUTES: ${{ !inputs.test && '15' || '' }}
